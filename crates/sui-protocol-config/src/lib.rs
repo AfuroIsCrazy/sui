@@ -885,6 +885,10 @@ struct FeatureFlags {
     // If true, deprecate global storage ops everywhere.
     #[serde(skip_serializing_if = "is_false")]
     deprecate_global_storage_ops: bool,
+
+    // If true, enable object funds withdraw.
+    #[serde(skip_serializing_if = "is_false")]
+    enable_object_funds_withdraw: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -4612,6 +4616,10 @@ impl ProtocolConfig {
 
     pub fn allow_references_in_ptbs_for_testing(&mut self) {
         self.feature_flags.allow_references_in_ptbs = true;
+    }
+
+    pub fn set_enable_object_funds_withdraw_for_testing(&mut self, val: bool) {
+        self.feature_flags.enable_object_funds_withdraw = val;
     }
 }
 
