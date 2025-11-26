@@ -571,15 +571,15 @@ fun claim_token_internal<T>(
     // extract token message
     let mut bypass_limiter = false;
     let mut token_payload;
-    if (record.message.message_version() == 1) {
-        token_payload = record.message.extract_token_bridge_payload();
-    } else if (record.message.message_version() == 2) {
+    if (record.message.message_version() == 2) {
         let token_payload_v2 = record.message.extract_token_bridge_payload_v2();
 
         let timestamp = token_payload_v2.timestamp_ms();
         // if token_payload.timestamp is within the last 48 hours, bypass the limiter
         bypass_limiter = clock.timestamp_ms() < timestamp + 48 * 3600000;
         token_payload = token_payload_v2.to_token_payload_v1();
+    } else {
+        token_payload = record.message.extract_token_bridge_payload();
     };
 
     // get owner address
