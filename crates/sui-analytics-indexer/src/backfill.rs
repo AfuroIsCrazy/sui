@@ -14,13 +14,20 @@ use std::ops::Range;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, anyhow};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 use tracing::{debug, info};
 
 use crate::config::FileFormat;
+
+/// Number of epochs to prefetch ahead of the current epoch.
+const PREFETCH_AHEAD: u64 = 10;
+
+/// Maximum epochs to keep in cache. Provides structural bound on memory.
+/// Set slightly higher than PREFETCH_AHEAD to avoid thrashing.
+const MAX_CACHED_EPOCHS: usize = 15;
 
 /// Target file metadata for backfill operations.
 #[derive(Debug, Clone)]
@@ -113,9 +120,10 @@ impl EpochBoundaries {
     }
 }
 
-/// Lazy-loading cache for backfill boundaries.
+/// Lazy-loading cache for backfill boundaries with background prefetching.
 ///
 /// Loads epoch data on-demand and caches it in a DashMap.
+/// Prefetches upcoming epochs in the background to avoid blocking on queries.
 /// Each batch clones an `Arc<EpochBoundaries>` to keep data alive.
 /// Old epochs can be pruned when processing moves forward.
 pub struct BackfillBoundaries {
@@ -127,6 +135,8 @@ pub struct BackfillBoundaries {
     file_format: FileFormat,
     /// Per-epoch cache (loaded on demand)
     epochs: DashMap<u64, Arc<EpochBoundaries>>,
+    /// Track in-flight prefetch tasks to avoid duplicate spawns
+    prefetching: DashSet<u64>,
 }
 
 impl BackfillBoundaries {
@@ -164,6 +174,7 @@ impl BackfillBoundaries {
             dir_prefix,
             file_format,
             epochs: DashMap::new(),
+            prefetching: DashSet::new(),
         })
     }
 
@@ -228,7 +239,8 @@ impl BackfillBoundaries {
     ///
     /// This is idempotent - if the epoch is already loaded, returns the cached Arc.
     /// The returned Arc keeps the epoch data alive even if pruned from cache.
-    pub async fn ensure_epoch_loaded(&self, epoch: u64) -> Result<Arc<EpochBoundaries>> {
+    /// Also triggers background prefetch of upcoming epochs.
+    pub async fn ensure_epoch_loaded(self: &Arc<Self>, epoch: u64) -> Result<Arc<EpochBoundaries>> {
         // Check cache first
         if let Some(entry) = self.epochs.get(&epoch) {
             return Ok(entry.clone());
@@ -240,8 +252,40 @@ impl BackfillBoundaries {
         // Insert into cache (handles race condition - another thread may have loaded it)
         self.epochs.entry(epoch).or_insert(epoch_data.clone());
 
+        // Enforce structural bound on cache size
+        self.enforce_cache_limit();
+
+        // Trigger prefetch for upcoming epochs
+        for future_epoch in (epoch + 1)..=(epoch + PREFETCH_AHEAD) {
+            self.prefetch_epoch(future_epoch);
+        }
+
         // Return the version in the cache (might be from another thread)
         Ok(self.epochs.get(&epoch).unwrap().clone())
+    }
+
+    /// Prefetch an epoch in the background. Non-blocking, errors are logged.
+    fn prefetch_epoch(self: &Arc<Self>, epoch: u64) {
+        // Skip if already cached or already prefetching
+        if self.epochs.contains_key(&epoch) || !self.prefetching.insert(epoch) {
+            return;
+        }
+
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            match this.load_epoch(epoch).await {
+                Ok(data) => {
+                    this.epochs.entry(epoch).or_insert(data);
+                    this.enforce_cache_limit();
+                    debug!(epoch, "Prefetched epoch boundaries");
+                }
+                Err(e) => {
+                    // Not an error - epoch may not exist yet (we're ahead of data)
+                    debug!(epoch, error = %e, "Prefetch failed (epoch may not exist)");
+                }
+            }
+            this.prefetching.remove(&epoch);
+        });
     }
 
     /// Get an Arc to an epoch's boundaries.
@@ -255,7 +299,8 @@ impl BackfillBoundaries {
     ///
     /// In-flight batches that hold Arcs to pruned epochs will keep the data alive.
     /// Once all batches for an epoch are complete, the memory is freed.
-    pub fn prune_epochs_before(&self, epoch: u64) {
+    /// Also triggers prefetch to maintain PREFETCH_AHEAD epochs in cache.
+    pub fn prune_epochs_before(self: &Arc<Self>, epoch: u64) {
         let before_count = self.epochs.len();
         self.epochs.retain(|&e, _| e >= epoch);
         let after_count = self.epochs.len();
@@ -267,6 +312,27 @@ impl BackfillBoundaries {
                 current_epoch = epoch,
                 "Pruned old epochs from backfill cache"
             );
+
+            // Prefetch to maintain PREFETCH_AHEAD in cache.
+            // After pruning, find the highest cached epoch and prefetch beyond it.
+            let highest_cached = self.epochs.iter().map(|e| *e.key()).max().unwrap_or(epoch);
+            for future_epoch in (highest_cached + 1)..=(epoch + PREFETCH_AHEAD) {
+                self.prefetch_epoch(future_epoch);
+            }
+        }
+    }
+
+    /// Evict oldest epochs if cache exceeds MAX_CACHED_EPOCHS.
+    /// Called after every insert to maintain structural bound on memory.
+    fn enforce_cache_limit(&self) {
+        while self.epochs.len() > MAX_CACHED_EPOCHS {
+            // Find and remove the lowest epoch number
+            if let Some(min_epoch) = self.epochs.iter().map(|e| *e.key()).min() {
+                self.epochs.remove(&min_epoch);
+                debug!(evicted = min_epoch, "Evicted epoch from cache (size limit)");
+            } else {
+                break;
+            }
         }
     }
 
